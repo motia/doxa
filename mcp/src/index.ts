@@ -62,7 +62,7 @@ function requireOp(op: string) {
 }
 
 function buildServer(): McpServer {
-  const server = new McpServer({ name: "koinon-files", version: "0.1.0" });
+  const server = new McpServer({ name: "doxa-files", version: "0.1.0" });
 
   server.registerTool("list", {
     description: "List files and directories inside the shared vault.",

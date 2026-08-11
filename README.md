@@ -1,4 +1,4 @@
-# Koinon
+# Doxa
 
 A tiny self-hosted vault hub for Obsidian (or any folder-based Markdown client):
 
@@ -29,8 +29,8 @@ The privacy boundary is a Docker bind mount, not merely an application rule: the
 ## Quick start
 
 ```bash
-git clone git@github.com:motia/koinon.git
-cd koinon
+git clone git@github.com:motia/doxa.git
+cd doxa
 cp .env.example .env
 ```
 
@@ -141,7 +141,7 @@ ingress:
 On the Motiavated managed controller, the MCP service joins the external Docker `web` network and is registered through the existing `managed-dev` stack:
 
 ```bash
-COMPOSE_PROJECT_NAME=koinon-managed \
+COMPOSE_PROJECT_NAME=doxa-managed \
   docker compose -f docker-compose.yml -f docker-compose.managed.yml up -d --build
 chmod +x scripts/register-managed-dev.py
 scripts/register-managed-dev.py
@@ -150,10 +150,10 @@ scripts/register-managed-dev.py
 This publishes the managed service at:
 
 ```text
-https://koinon-managed.motiavated.com/mcp
+https://doxa-managed.motiavated.com/mcp
 ```
 
-The `-managed` suffix is the convention for persistent managed services. The registration points Traefik directly at `http://koinon-managed-mcp:3000`; it does not expose the loopback port. To remove only the external route while preserving Koinon data and containers, run `managed-dev remove-route koinon-managed`.
+The `-managed` suffix is the convention for persistent managed services. The registration points Traefik directly at `http://doxa-managed-mcp:3000`; it does not expose the loopback port. To remove only the external route while preserving Doxa data and containers, run `managed-dev remove-route doxa-managed`.
 
 The MCP endpoint then becomes:
 
