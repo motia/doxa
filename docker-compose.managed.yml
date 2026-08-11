@@ -1,0 +1,9 @@
+services:
+  mcp:
+    networks:
+      - default
+      - web
+
+networks:
+  web:
+    external: true

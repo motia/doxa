@@ -1,8 +1,8 @@
 services:
   syncthing:
     image: syncthing/syncthing:latest
-    container_name: obsidian-managed-syncthing
-    hostname: ${SYNCTHING_DEVICE_NAME:-vault-vps}
+    container_name: koinon-managed-syncthing
+    hostname: ${SYNCTHING_DEVICE_NAME:-koinon-vps}
     restart: unless-stopped
     environment:
       PUID: ${PUID:-1000}
@@ -20,7 +20,7 @@ services:
   mcp:
     build:
       context: ./mcp
-    container_name: obsidian-managed-mcp
+    container_name: koinon-managed-mcp
     restart: unless-stopped
     environment:
       PORT: 3000
