@@ -439,6 +439,43 @@ test("completes PKCE authorization, refresh, and authenticated MCP access", asyn
   }
 });
 
+test("does not count successful owner authorization pages toward the failure limit", async () => {
+  const { child, port } = await startServer();
+  try {
+    const registration = await fetch(`http://127.0.0.1:${port}/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "ChatGPT retry test",
+        redirect_uris: ["https://chatgpt.com/connector/oauth/retry-callback"],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      }),
+    });
+    const client = await registration.json();
+    const verifier = crypto.randomBytes(32).toString("base64url");
+    const authorize = new URL(`http://127.0.0.1:${port}/authorize`);
+    authorize.search = new URLSearchParams({
+      response_type: "code",
+      client_id: client.client_id,
+      redirect_uri: client.redirect_uris[0],
+      code_challenge: crypto.createHash("sha256").update(verifier).digest("base64url"),
+      code_challenge_method: "S256",
+      scope: "doxa:read offline_access",
+      state: "retry-state",
+      resource: "https://doxa.example.test/mcp",
+    }).toString();
+    const authorization = `Basic ${Buffer.from("owner:correct horse battery staple").toString("base64")}`;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const response = await fetch(authorize, { headers: { authorization } });
+      assert.equal(response.status, 200);
+    }
+  } finally {
+    await stopServer(child);
+  }
+});
+
 test("rate limits failed owner authentication attempts", async () => {
   const { child, port } = await startServer();
   try {

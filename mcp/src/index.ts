@@ -300,6 +300,7 @@ app.use(express.json({ limit: "2mb" }));
 app.use("/authorize", rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
   message: "Too many authorization attempts; try again later.",
@@ -308,6 +309,7 @@ app.post("/approve",
   rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
+    skipSuccessfulRequests: true,
     standardHeaders: true,
     legacyHeaders: false,
     message: "Too many authorization confirmations; try again later.",
@@ -331,6 +333,26 @@ app.post("/approve",
     await oauthProvider.approveConsent(consentId, csrfToken, sessionToken, decision, res);
   },
 );
+app.use("/token", (req, res, next) => {
+  const startedAt = Date.now();
+  res.once("finish", () => {
+    const body = req.body as Record<string, unknown> | undefined;
+    const stringLength = (value: unknown) => typeof value === "string" ? value.length : 0;
+    console.log(JSON.stringify({
+      event: "oauth_token_request",
+      status: res.statusCode,
+      durationMs: Date.now() - startedAt,
+      grantType: typeof body?.grant_type === "string" ? body.grant_type : "missing",
+      clientIdPresent: stringLength(body?.client_id) > 0,
+      codeLength: stringLength(body?.code),
+      verifierLength: stringLength(body?.code_verifier),
+      redirectUriPresent: stringLength(body?.redirect_uri) > 0,
+      resourcePresent: stringLength(body?.resource) > 0,
+      refreshTokenLength: stringLength(body?.refresh_token),
+    }));
+  });
+  next();
+});
 app.use(mcpAuthRouter({
   provider: oauthProvider,
   issuerUrl: PUBLIC_BASE_URL,
