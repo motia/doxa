@@ -6,9 +6,10 @@ This project is intended first for a private/single-user deployment.
 
 - Never mount the full vault into the MCP container. Mount only `Shared/`.
 - Never expose the MCP or Syncthing GUI ports directly to the public Internet.
-- Use a long random `MCP_TOKEN` and keep `.env` out of source control.
+- Keep the OAuth owner login, legacy token, master key, and encrypted runtime files out of source control; preserve mode `0600` on credential files.
+- Use HTTPS for the public OAuth/MCP endpoint; HTTP Basic protects only the owner approval step and depends on TLS.
 - Treat Syncthing as synchronization, not backup.
 
 ## Commercial/multi-user deployments
 
-The included bearer-token authentication is deliberately small and is not a complete multi-tenant identity system. Before commercial hosting, add OAuth/OIDC, tenant isolation, per-user permissions, audit logs, rate limits, secret management, and tested backups/restores.
+The included OAuth server is designed for a private single-owner deployment and is not a complete multi-tenant identity system. Before commercial hosting, use a hardened identity provider and add tenant isolation, per-user permissions, audit logs, stronger rate-limit controls, managed keys, and tested backups/restores.

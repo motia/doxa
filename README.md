@@ -34,18 +34,25 @@ cd doxa
 cp .env.example .env
 ```
 
-Generate a long token and place it in `.env`:
+Create the vault areas, build the secret-management utility, and initialize the encrypted OAuth bundle:
 
 ```bash
-openssl rand -hex 32
-```
-
-Create the vault areas and start the services:
-
-```bash
-mkdir -p data/vault/{Shared,Private}
+mkdir -p data/vault/{Shared,Private} data/oauth/state
+cd mcp
+npm ci
+npm run build
+MCP_TOKEN="$(openssl rand -hex 32)" \
+  npm run secrets -- init \
+  ../data/oauth/oauth-master.key \
+  ../data/oauth/oauth-secrets.enc \
+  motia
+cd ..
+chmod 700 data/oauth data/oauth/state
+chmod 600 data/oauth/oauth-master.key data/oauth/oauth-secrets.enc
 docker compose up -d --build
 ```
+
+The generated OAuth owner password is stored only inside the encrypted bundle. Retrieve it later from a private terminal using the `show` command documented below.
 
 Check status:
 
@@ -112,21 +119,66 @@ For a read-only deployment:
 MCP_ALLOWED_OPS=read,list,search
 ```
 
-## MCP authentication
+## MCP authentication and ChatGPT
 
-The MCP endpoint uses a static bearer token:
+Doxa includes an OAuth 2.1 authorization server compatible with remote MCP clients. It provides:
 
-```http
-Authorization: Bearer <MCP_TOKEN>
-```
+- OAuth authorization-server metadata
+- MCP protected-resource metadata
+- Dynamic Client Registration
+- authorization-code flow with PKCE `S256`
+- one-hour access tokens
+- rotating 30-day refresh tokens
+- token revocation
+- encrypted persistent registration/token state
 
-The endpoint is:
+Public endpoint:
 
 ```text
-http://127.0.0.1:3010/mcp
+https://doxa-managed.motiavated.com/mcp
 ```
 
-The token is a simple service credential, suitable for a private/single-user deployment. For a multi-user commercial deployment, replace it with proper OAuth/OIDC and per-user authorization.
+Discovery endpoints:
+
+```text
+https://doxa-managed.motiavated.com/.well-known/oauth-protected-resource/mcp
+https://doxa-managed.motiavated.com/.well-known/oauth-authorization-server
+```
+
+ChatGPT can call MCP `initialize` and `tools/list` without credentials so it can discover the app. Every file tool declares its required OAuth scope (`doxa:read` or `doxa:write`) and returns an MCP `mcp/www_authenticate` challenge when authorization is missing. No vault data is returned anonymously.
+
+The `/authorize` endpoint uses a single-owner HTTPS Basic challenge. Retrieve the owner login only in a private server terminal:
+
+```bash
+cd mcp
+npm run build
+npm run secrets -- show \
+  ../data/oauth/oauth-master.key \
+  ../data/oauth/oauth-secrets.enc
+```
+
+Never post that output in chat, logs, tickets, or source control.
+
+To connect ChatGPT on the web:
+
+1. Enable **Developer mode** under ChatGPT **Settings → Security and login**.
+2. Open **Apps/Plugins**, select **Create app**, and name it `Doxa`.
+3. Set the MCP server URL to `https://doxa-managed.motiavated.com/mcp`.
+4. Select **OAuth** authentication. Dynamic registration supplies the client details.
+5. When the browser opens Doxa authorization, enter the owner username/password from the private `show` command.
+6. Approve the app and confirm ChatGPT discovers `list`, `read`, `search`, `write`, `mkdir`, and `move`.
+
+Doxa retains the former static bearer token as a legacy credential for trusted clients, but that token now lives only in the encrypted bundle. ChatGPT uses OAuth instead.
+
+### Encrypted files
+
+```text
+data/oauth/oauth-secrets.enc   AES-256-GCM encrypted owner login, legacy token, and token key
+data/oauth/state/oauth-state.enc  AES-256-GCM encrypted clients, codes, and tokens
+data/oauth/oauth-master.key    Separate 256-bit decryption key, mode 0600
+```
+
+The key and encrypted files are runtime data under ignored `data/`; none are committed. Keeping the decryption key beside the ciphertext protects against accidental plaintext disclosure and repository leakage, but not a root-level compromise of the host. For a stronger threat model, mount the key from a secret manager or hardware-backed store.
 
 ## Cloudflare Tunnel
 
@@ -197,12 +249,13 @@ Syncthing is synchronization, not backup. Back up the VPS vault independently an
 - MCP has no delete or shell tool.
 - Tool exposure is allowlisted with `MCP_ALLOWED_OPS`.
 - MCP and Syncthing GUI bind to localhost.
-- MCP requires a bearer token.
+- MCP requires OAuth 2.1 with PKCE, with a retained encrypted legacy token for trusted clients.
+- OAuth credentials and persistent client/token state are encrypted at rest with AES-256-GCM.
 - MCP rejects `..` traversal and symlinks.
 - MCP container runs as an unprivileged Node user with a read-only root filesystem and `no-new-privileges`.
 - Syncthing discovery/sync ports remain available so devices can synchronize.
 
-For multi-user/hosted commercialization, add OAuth/OIDC, tenant-specific vault isolation, audit logging, quotas, encrypted secret management, and stronger lifecycle/backup controls before treating this as a production multi-tenant service.
+For multi-user/hosted commercialization, replace the single-owner authorization gate with a hardened external identity provider, add tenant-specific vault isolation, audit logging, quotas, managed key storage, and stronger lifecycle/backup controls before treating this as a production multi-tenant service.
 
 ## Why not run Obsidian on the VPS?
 

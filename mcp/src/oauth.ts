@@ -1,0 +1,296 @@
+import crypto from "node:crypto";
+import type { Response } from "express";
+import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
+import type { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import {
+  InvalidGrantError,
+  InvalidRequestError,
+  InvalidScopeError,
+  InvalidTokenError,
+} from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type {
+  OAuthClientInformationFull,
+  OAuthTokenRevocationRequest,
+  OAuthTokens,
+} from "@modelcontextprotocol/sdk/shared/auth.js";
+import { decryptJsonFile, encryptJsonFile } from "./secrets.js";
+
+const ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
+const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+function opaqueToken(): string {
+  return crypto.randomBytes(48).toString("base64url");
+}
+
+type CodeRecord = {
+  clientId: string;
+  params: AuthorizationParams;
+  expiresAt: number;
+};
+
+type TokenRecord = {
+  token: string;
+  clientId: string;
+  scopes: string[];
+  resource: URL;
+  expiresAt: number;
+};
+
+class MemoryClientsStore implements OAuthRegisteredClientsStore {
+  readonly clients = new Map<string, OAuthClientInformationFull>();
+
+  constructor(private readonly onChange: () => Promise<void>) {}
+
+  getClient(clientId: string): OAuthClientInformationFull | undefined {
+    return this.clients.get(clientId);
+  }
+
+  async registerClient(client: OAuthClientInformationFull): Promise<OAuthClientInformationFull> {
+    this.clients.set(client.client_id, client);
+    await this.onChange();
+    return client;
+  }
+}
+
+type ProviderOptions = {
+  stateFile?: string;
+  stateKey?: Buffer;
+};
+
+type StoredTokenRecord = Omit<TokenRecord, "resource"> & { resource: string };
+type StoredCodeRecord = Omit<CodeRecord, "params"> & {
+  params: Omit<AuthorizationParams, "resource"> & { resource?: string };
+};
+type StoredState = {
+  version: 1;
+  clients: Array<[string, OAuthClientInformationFull]>;
+  codes: Array<[string, StoredCodeRecord]>;
+  accessTokens: Array<[string, StoredTokenRecord]>;
+  refreshTokens: Array<[string, StoredTokenRecord]>;
+};
+
+export class DoxaOAuthProvider implements OAuthServerProvider {
+  readonly clientsStore: MemoryClientsStore;
+  readonly codes = new Map<string, CodeRecord>();
+  readonly accessTokens = new Map<string, TokenRecord>();
+  readonly refreshTokens = new Map<string, TokenRecord>();
+  private saveQueue = Promise.resolve();
+
+  constructor(private readonly resourceUrl: URL, private readonly options: ProviderOptions = {}) {
+    this.clientsStore = new MemoryClientsStore(() => this.persist());
+    if ((options.stateFile && !options.stateKey) || (!options.stateFile && options.stateKey)) {
+      throw new Error("OAuth stateFile and stateKey must be configured together");
+    }
+  }
+
+  async load(): Promise<void> {
+    if (!this.options.stateFile || !this.options.stateKey) return;
+    try {
+      const state = await decryptJsonFile<StoredState>(
+        this.options.stateFile,
+        this.options.stateKey,
+        "doxa-oauth-state:v1",
+      );
+      if (state.version !== 1) throw new Error("Unsupported OAuth state version");
+      this.clientsStore.clients.clear();
+      for (const [key, value] of state.clients) this.clientsStore.clients.set(key, value);
+      this.codes.clear();
+      for (const [key, value] of state.codes) {
+        this.codes.set(key, {
+          ...value,
+          params: {
+            ...value.params,
+            resource: value.params.resource ? new URL(value.params.resource) : undefined,
+          },
+        });
+      }
+      this.accessTokens.clear();
+      for (const [key, value] of state.accessTokens) {
+        this.accessTokens.set(key, { ...value, resource: new URL(value.resource) });
+      }
+      this.refreshTokens.clear();
+      for (const [key, value] of state.refreshTokens) {
+        this.refreshTokens.set(key, { ...value, resource: new URL(value.resource) });
+      }
+      this.pruneExpired();
+    } catch (error: any) {
+      if (error?.cause?.code === "ENOENT" || error?.code === "ENOENT") return;
+      throw error;
+    }
+  }
+
+  async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
+    if (!client.redirect_uris.includes(params.redirectUri)) {
+      throw new InvalidRequestError("Unregistered redirect_uri");
+    }
+    this.assertResource(params.resource);
+    this.assertScopes(params.scopes ?? []);
+    const code = opaqueToken();
+    this.codes.set(code, {
+      clientId: client.client_id,
+      params,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+    await this.persist();
+    const callback = new URL(params.redirectUri);
+    callback.searchParams.set("code", code);
+    if (params.state) callback.searchParams.set("state", params.state);
+    res.redirect(302, callback.href);
+  }
+
+  async challengeForAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<string> {
+    const record = this.validCode(client, authorizationCode);
+    return record.params.codeChallenge;
+  }
+
+  async exchangeAuthorizationCode(
+    client: OAuthClientInformationFull,
+    authorizationCode: string,
+    _codeVerifier?: string,
+    redirectUri?: string,
+    resource?: URL,
+  ): Promise<OAuthTokens> {
+    const record = this.validCode(client, authorizationCode);
+    if (redirectUri && redirectUri !== record.params.redirectUri) {
+      throw new InvalidGrantError("redirect_uri does not match the authorization request");
+    }
+    this.assertResource(resource ?? record.params.resource);
+    this.codes.delete(authorizationCode);
+    return this.issueTokens(client.client_id, record.params.scopes ?? [], resource ?? record.params.resource);
+  }
+
+  async exchangeRefreshToken(
+    client: OAuthClientInformationFull,
+    refreshToken: string,
+    scopes?: string[],
+    resource?: URL,
+  ): Promise<OAuthTokens> {
+    const record = this.refreshTokens.get(refreshToken);
+    if (!record || record.clientId !== client.client_id || record.expiresAt <= Date.now()) {
+      throw new InvalidGrantError("Invalid or expired refresh token");
+    }
+    const requestedScopes = scopes ?? record.scopes;
+    if (!requestedScopes.every((scope) => record.scopes.includes(scope))) {
+      throw new InvalidScopeError("Refresh scope exceeds the originally granted scope");
+    }
+    this.assertResource(resource ?? record.resource);
+    this.refreshTokens.delete(refreshToken);
+    return this.issueTokens(client.client_id, requestedScopes, resource ?? record.resource);
+  }
+
+  async verifyAccessToken(token: string): Promise<AuthInfo> {
+    const record = this.accessTokens.get(token);
+    if (!record || record.expiresAt <= Date.now()) {
+      throw new InvalidTokenError("Invalid or expired access token");
+    }
+    return {
+      token,
+      clientId: record.clientId,
+      scopes: record.scopes,
+      expiresAt: Math.floor(record.expiresAt / 1000),
+      resource: record.resource,
+    };
+  }
+
+  async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
+    const access = this.accessTokens.get(request.token);
+    if (access?.clientId === client.client_id) this.accessTokens.delete(request.token);
+    const refresh = this.refreshTokens.get(request.token);
+    if (refresh?.clientId === client.client_id) this.refreshTokens.delete(request.token);
+    await this.persist();
+  }
+
+  private validCode(client: OAuthClientInformationFull, code: string): CodeRecord {
+    const record = this.codes.get(code);
+    if (!record || record.clientId !== client.client_id || record.expiresAt <= Date.now()) {
+      throw new InvalidGrantError("Invalid or expired authorization code");
+    }
+    return record;
+  }
+
+  private assertResource(resource?: URL): asserts resource is URL {
+    if (!resource || resource.href !== this.resourceUrl.href) {
+      throw new InvalidRequestError(`Invalid resource; expected ${this.resourceUrl.href}`);
+    }
+  }
+
+  private assertScopes(scopes: string[]): void {
+    const allowed = new Set(["doxa:read", "doxa:write", "offline_access"]);
+    if (!scopes.every((scope) => allowed.has(scope))) {
+      throw new InvalidScopeError("Unsupported scope requested");
+    }
+  }
+
+  private pruneExpired(): void {
+    const now = Date.now();
+    for (const [key, value] of this.codes) if (value.expiresAt <= now) this.codes.delete(key);
+    for (const [key, value] of this.accessTokens) if (value.expiresAt <= now) this.accessTokens.delete(key);
+    for (const [key, value] of this.refreshTokens) if (value.expiresAt <= now) this.refreshTokens.delete(key);
+  }
+
+  private snapshot(): StoredState {
+    this.pruneExpired();
+    return {
+      version: 1,
+      clients: [...this.clientsStore.clients.entries()],
+      codes: [...this.codes.entries()].map(([key, value]) => [key, {
+        ...value,
+        params: {
+          ...value.params,
+          resource: value.params.resource?.href,
+        },
+      }]),
+      accessTokens: [...this.accessTokens.entries()].map(([key, value]) => [key, {
+        ...value,
+        resource: value.resource.href,
+      }]),
+      refreshTokens: [...this.refreshTokens.entries()].map(([key, value]) => [key, {
+        ...value,
+        resource: value.resource.href,
+      }]),
+    };
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.options.stateFile || !this.options.stateKey) return;
+    this.saveQueue = this.saveQueue
+      .catch(() => undefined)
+      .then(() => encryptJsonFile(
+        this.options.stateFile!,
+        this.options.stateKey!,
+        this.snapshot(),
+        "doxa-oauth-state:v1",
+      ));
+    await this.saveQueue;
+  }
+
+  private async issueTokens(clientId: string, scopes: string[], resource?: URL): Promise<OAuthTokens> {
+    this.assertResource(resource);
+    const now = Date.now();
+    const accessToken = opaqueToken();
+    const refreshToken = opaqueToken();
+    this.accessTokens.set(accessToken, {
+      token: accessToken,
+      clientId,
+      scopes,
+      resource,
+      expiresAt: now + ACCESS_TOKEN_TTL_SECONDS * 1000,
+    });
+    this.refreshTokens.set(refreshToken, {
+      token: refreshToken,
+      clientId,
+      scopes,
+      resource,
+      expiresAt: now + REFRESH_TOKEN_TTL_SECONDS * 1000,
+    });
+    await this.persist();
+    return {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      token_type: "Bearer",
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+      scope: scopes.join(" "),
+    };
+  }
+}
