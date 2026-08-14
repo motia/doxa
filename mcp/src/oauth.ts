@@ -92,7 +92,7 @@ class MemoryClientsStore implements OAuthRegisteredClientsStore {
 
   async registerClient(client: OAuthClientInformationFull): Promise<OAuthClientInformationFull> {
     if (!client.redirect_uris.length || !client.redirect_uris.every(isAllowedChatGptRedirect)) {
-      throw new InvalidClientMetadataError("All redirect_uris must be exact ChatGPT connector callback URLs");
+      throw new InvalidClientMetadataError("All redirect_uris must match a documented ChatGPT connector callback pattern");
     }
     this.clients.set(client.client_id, client);
     await this.onChange();
@@ -117,6 +117,65 @@ type StoredState = {
   refreshTokens: Array<[string, StoredTokenRecord]>;
 };
 
+const ALLOWED_SCOPES = new Set(["doxa:read", "doxa:write", "offline_access"]);
+
+function hasValidScopes(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((scope) => typeof scope === "string" && ALLOWED_SCOPES.has(scope));
+}
+
+function hasValidExpiry(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > Date.now();
+}
+
+function isValidStoredClient(key: unknown, value: unknown): value is OAuthClientInformationFull {
+  if (!value || typeof value !== "object") return false;
+  const client = value as Partial<OAuthClientInformationFull>;
+  return typeof key === "string"
+    && typeof client.client_id === "string"
+    && key === client.client_id
+    && Array.isArray(client.redirect_uris)
+    && client.redirect_uris.length > 0
+    && client.redirect_uris.every((uri) => typeof uri === "string" && isAllowedChatGptRedirect(uri))
+    && client.token_endpoint_auth_method === "none";
+}
+
+function isValidStoredCode(
+  key: unknown,
+  value: unknown,
+  clients: Map<string, OAuthClientInformationFull>,
+  resourceUrl: URL,
+): value is StoredCodeRecord {
+  if (typeof key !== "string" || key.length < 40 || !value || typeof value !== "object") return false;
+  const record = value as Partial<StoredCodeRecord>;
+  const params = record.params as Record<string, unknown> | undefined;
+  const client = typeof record.clientId === "string" ? clients.get(record.clientId) : undefined;
+  return !!client
+    && hasValidExpiry(record.expiresAt)
+    && !!params
+    && typeof params.redirectUri === "string"
+    && client.redirect_uris.includes(params.redirectUri)
+    && typeof params.codeChallenge === "string"
+    && /^[A-Za-z0-9_-]{43}$/.test(params.codeChallenge)
+    && hasValidScopes(params.scopes)
+    && params.resource === resourceUrl.href;
+}
+
+function isValidStoredToken(
+  key: unknown,
+  value: unknown,
+  clients: Map<string, OAuthClientInformationFull>,
+  resourceUrl: URL,
+): value is StoredTokenRecord {
+  if (typeof key !== "string" || key.length < 40 || !value || typeof value !== "object") return false;
+  const record = value as Partial<StoredTokenRecord>;
+  return record.token === key
+    && typeof record.clientId === "string"
+    && clients.has(record.clientId)
+    && hasValidScopes(record.scopes)
+    && record.resource === resourceUrl.href
+    && hasValidExpiry(record.expiresAt);
+}
+
 export class DoxaOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: MemoryClientsStore;
   readonly codes = new Map<string, CodeRecord>();
@@ -140,48 +199,59 @@ export class DoxaOAuthProvider implements OAuthServerProvider {
         this.options.stateKey,
         "doxa-oauth-state:v1",
       );
-      if (state.version !== 1) throw new Error("Unsupported OAuth state version");
+      if (state.version !== 1
+        || !Array.isArray(state.clients)
+        || !Array.isArray(state.codes)
+        || !Array.isArray(state.accessTokens)
+        || !Array.isArray(state.refreshTokens)) {
+        throw new Error("Unsupported or malformed OAuth state structure");
+      }
       this.clientsStore.clients.clear();
-      let removedClient = false;
-      for (const [key, value] of state.clients) {
-        if (value.redirect_uris.length && value.redirect_uris.every(isAllowedChatGptRedirect)) {
-          this.clientsStore.clients.set(key, value);
+      let dirty = false;
+      for (const entry of state.clients) {
+        if (Array.isArray(entry) && entry.length === 2 && isValidStoredClient(entry[0], entry[1])) {
+          this.clientsStore.clients.set(entry[0], entry[1]);
         } else {
-          removedClient = true;
+          dirty = true;
         }
       }
       this.codes.clear();
-      for (const [key, value] of state.codes) {
-        if (this.clientsStore.clients.has(value.clientId)) {
+      for (const entry of state.codes) {
+        if (Array.isArray(entry) && entry.length === 2
+          && isValidStoredCode(entry[0], entry[1], this.clientsStore.clients, this.resourceUrl)) {
+          const [key, value] = entry;
           this.codes.set(key, {
             ...value,
             params: {
               ...value.params,
-              resource: value.params.resource ? new URL(value.params.resource) : undefined,
+              resource: new URL(value.params.resource!),
             },
           });
         } else {
-          removedClient = true;
+          dirty = true;
         }
       }
       this.accessTokens.clear();
-      for (const [key, value] of state.accessTokens) {
-        if (this.clientsStore.clients.has(value.clientId)) {
+      for (const entry of state.accessTokens) {
+        if (Array.isArray(entry) && entry.length === 2
+          && isValidStoredToken(entry[0], entry[1], this.clientsStore.clients, this.resourceUrl)) {
+          const [key, value] = entry;
           this.accessTokens.set(key, { ...value, resource: new URL(value.resource) });
         } else {
-          removedClient = true;
+          dirty = true;
         }
       }
       this.refreshTokens.clear();
-      for (const [key, value] of state.refreshTokens) {
-        if (this.clientsStore.clients.has(value.clientId)) {
+      for (const entry of state.refreshTokens) {
+        if (Array.isArray(entry) && entry.length === 2
+          && isValidStoredToken(entry[0], entry[1], this.clientsStore.clients, this.resourceUrl)) {
+          const [key, value] = entry;
           this.refreshTokens.set(key, { ...value, resource: new URL(value.resource) });
         } else {
-          removedClient = true;
+          dirty = true;
         }
       }
-      this.pruneExpired();
-      if (removedClient) await this.persist();
+      if (dirty) await this.persist();
     } catch (error: any) {
       if (error?.cause?.code === "ENOENT" || error?.code === "ENOENT") return;
       throw error;
@@ -326,8 +396,7 @@ export class DoxaOAuthProvider implements OAuthServerProvider {
   }
 
   private assertScopes(scopes: string[]): void {
-    const allowed = new Set(["doxa:read", "doxa:write", "offline_access"]);
-    if (!scopes.every((scope) => allowed.has(scope))) {
+    if (!hasValidScopes(scopes)) {
       throw new InvalidScopeError("Unsupported scope requested");
     }
   }

@@ -198,6 +198,53 @@ test("loads encrypted secrets and preserves OAuth clients in encrypted state acr
   }
 });
 
+test("purges expired and malformed encrypted OAuth records during load", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "doxa-oauth-state-validation-"));
+  try {
+    const stateFile = path.join(dir, "oauth-state.enc");
+    const key = crypto.randomBytes(32);
+    const { encryptJsonFile, decryptJsonFile } = await import("../dist/secrets.js");
+    const { DoxaOAuthProvider } = await import("../dist/oauth.js");
+    const client = {
+      client_id: "chatgpt-valid-client",
+      client_name: "ChatGPT",
+      redirect_uris: ["https://chatgpt.com/connector/oauth/valid-callback-id"],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    };
+    const now = Date.now();
+    await encryptJsonFile(stateFile, key, {
+      version: 1,
+      clients: [[client.client_id, client]],
+      codes: [
+        ["expired-code", { clientId: client.client_id, expiresAt: now - 1, params: { redirectUri: client.redirect_uris[0], codeChallenge: "A".repeat(43), scopes: ["doxa:read"], resource: "https://doxa.example.test/mcp" } }],
+        ["malformed-code", { clientId: client.client_id, expiresAt: now + 60_000, params: { redirectUri: "https://chatgpt.com/connector/oauth/other", codeChallenge: "bad", scopes: ["doxa:admin"], resource: "https://other.example/mcp" } }],
+      ],
+      accessTokens: [
+        ["access-key", { token: "different-token", clientId: client.client_id, scopes: ["doxa:read"], resource: "https://doxa.example.test/mcp", expiresAt: now + 60_000 }],
+      ],
+      refreshTokens: [
+        ["refresh-key", { token: "refresh-key", clientId: client.client_id, scopes: ["doxa:admin"], resource: "https://doxa.example.test/mcp", expiresAt: now + 60_000 }],
+      ],
+    }, "doxa-oauth-state:v1");
+
+    const provider = new DoxaOAuthProvider(new URL("https://doxa.example.test/mcp"), { stateFile, stateKey: key });
+    await provider.load();
+    assert.equal(provider.clientsStore.clients.size, 1);
+    assert.equal(provider.codes.size, 0);
+    assert.equal(provider.accessTokens.size, 0);
+    assert.equal(provider.refreshTokens.size, 0);
+
+    const cleaned = await decryptJsonFile(stateFile, key, "doxa-oauth-state:v1");
+    assert.deepEqual(cleaned.codes, []);
+    assert.deepEqual(cleaned.accessTokens, []);
+    assert.deepEqual(cleaned.refreshTokens, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("encrypts OAuth secrets at rest and rejects the wrong master key", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "doxa-secrets-"));
   try {

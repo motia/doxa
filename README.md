@@ -125,7 +125,7 @@ Doxa includes an OAuth 2.1 authorization server compatible with remote MCP clien
 
 - OAuth authorization-server metadata
 - MCP protected-resource metadata
-- Dynamic Client Registration restricted to exact ChatGPT HTTPS connector callback URLs
+- Dynamic Client Registration restricted to the documented ChatGPT HTTPS connector callback pattern; authorization later requires an exact match to the registered URI
 - explicit owner consent with the client name, exact redirect URI, requested scopes, and same-session CSRF protection
 - authorization-code flow with PKCE `S256`
 - one-hour access tokens
