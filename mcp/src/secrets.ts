@@ -9,7 +9,6 @@ export type SecretBundle = {
   adminUsername: string;
   adminPassword: string;
   legacyMcpToken: string;
-  tokenPepper: string;
 };
 
 type Envelope = {
@@ -34,8 +33,7 @@ function isSecretBundle(value: unknown): value is SecretBundle {
     && typeof candidate.adminPassword === "string"
     && candidate.adminPassword.length >= 16
     && typeof candidate.legacyMcpToken === "string"
-    && typeof candidate.tokenPepper === "string"
-    && candidate.tokenPepper.length >= 32;
+    && candidate.legacyMcpToken.length >= 24;
 }
 
 export async function encryptJsonFile(file: string, key: Buffer, value: unknown, purpose: string): Promise<void> {

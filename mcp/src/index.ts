@@ -304,6 +304,33 @@ app.use("/authorize", rateLimit({
   legacyHeaders: false,
   message: "Too many authorization attempts; try again later.",
 }), ownerAuthenticate);
+app.post("/approve",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: "Too many authorization confirmations; try again later.",
+  }),
+  ownerAuthenticate,
+  express.urlencoded({ extended: false, limit: "16kb" }),
+  async (req, res) => {
+    const consentId = typeof req.body?.consent_id === "string" ? req.body.consent_id : "";
+    const csrfToken = typeof req.body?.csrf_token === "string" ? req.body.csrf_token : "";
+    const decision = typeof req.body?.decision === "string" ? req.body.decision : "";
+    const cookieHeader = req.header("cookie") ?? "";
+    const sessionToken = cookieHeader
+      .split(";")
+      .map((entry) => entry.trim())
+      .find((entry) => entry.startsWith("doxa_oauth_session="))
+      ?.slice("doxa_oauth_session=".length) ?? "";
+    if (consentId.length > 256 || csrfToken.length > 256 || sessionToken.length > 256) {
+      res.status(400).send("Invalid authorization confirmation");
+      return;
+    }
+    await oauthProvider.approveConsent(consentId, csrfToken, sessionToken, decision, res);
+  },
+);
 app.use(mcpAuthRouter({
   provider: oauthProvider,
   issuerUrl: PUBLIC_BASE_URL,

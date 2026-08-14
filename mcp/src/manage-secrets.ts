@@ -25,7 +25,6 @@ if (command === "init") {
     adminUsername,
     adminPassword,
     legacyMcpToken,
-    tokenPepper: crypto.randomBytes(32).toString("base64url"),
   });
   console.log(`Encrypted OAuth secrets created at ${secretsFile}`);
   console.log(`Master key created at ${masterKeyFile}`);

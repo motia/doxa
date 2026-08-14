@@ -125,7 +125,8 @@ Doxa includes an OAuth 2.1 authorization server compatible with remote MCP clien
 
 - OAuth authorization-server metadata
 - MCP protected-resource metadata
-- Dynamic Client Registration
+- Dynamic Client Registration restricted to exact ChatGPT HTTPS connector callback URLs
+- explicit owner consent with the client name, exact redirect URI, requested scopes, and same-session CSRF protection
 - authorization-code flow with PKCE `S256`
 - one-hour access tokens
 - rotating 30-day refresh tokens
@@ -147,7 +148,7 @@ https://doxa-managed.motiavated.com/.well-known/oauth-authorization-server
 
 ChatGPT can call MCP `initialize` and `tools/list` without credentials so it can discover the app. Every file tool declares its required OAuth scope (`doxa:read` or `doxa:write`) and returns an MCP `mcp/www_authenticate` challenge when authorization is missing. No vault data is returned anonymously.
 
-The `/authorize` endpoint uses a single-owner HTTPS Basic challenge. Retrieve the owner login only in a private server terminal:
+The `/authorize` endpoint first uses a single-owner HTTPS Basic challenge, then displays an explicit consent screen showing the client, exact redirect URI, and requested scopes. Approval requires a short-lived same-session CSRF token. Retrieve the owner login only in a private server terminal:
 
 ```bash
 cd mcp
@@ -173,7 +174,7 @@ Doxa retains the former static bearer token as a legacy credential for trusted c
 ### Encrypted files
 
 ```text
-data/oauth/oauth-secrets.enc   AES-256-GCM encrypted owner login, legacy token, and token key
+data/oauth/oauth-secrets.enc   AES-256-GCM encrypted owner login and legacy token
 data/oauth/state/oauth-state.enc  AES-256-GCM encrypted clients, codes, and tokens
 data/oauth/oauth-master.key    Separate 256-bit decryption key, mode 0600
 ```

@@ -4,6 +4,7 @@ import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/serv
 import type { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import {
+  InvalidClientMetadataError,
   InvalidGrantError,
   InvalidRequestError,
   InvalidScopeError,
@@ -37,6 +38,49 @@ type TokenRecord = {
   expiresAt: number;
 };
 
+type PendingConsent = {
+  clientId: string;
+  params: AuthorizationParams;
+  csrfHash: string;
+  sessionHash: string;
+  expiresAt: number;
+};
+
+function sha256(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function isAllowedChatGptRedirect(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && url.origin === "https://chatgpt.com"
+      && !url.username
+      && !url.password
+      && !url.search
+      && !url.hash
+      && ((url.pathname.startsWith("/connector/oauth/") && url.pathname.length > "/connector/oauth/".length)
+        || url.pathname === "/connector_platform_oauth_redirect");
+  } catch {
+    return false;
+  }
+}
+
 class MemoryClientsStore implements OAuthRegisteredClientsStore {
   readonly clients = new Map<string, OAuthClientInformationFull>();
 
@@ -47,6 +91,9 @@ class MemoryClientsStore implements OAuthRegisteredClientsStore {
   }
 
   async registerClient(client: OAuthClientInformationFull): Promise<OAuthClientInformationFull> {
+    if (!client.redirect_uris.length || !client.redirect_uris.every(isAllowedChatGptRedirect)) {
+      throw new InvalidClientMetadataError("All redirect_uris must be exact ChatGPT connector callback URLs");
+    }
     this.clients.set(client.client_id, client);
     await this.onChange();
     return client;
@@ -75,6 +122,7 @@ export class DoxaOAuthProvider implements OAuthServerProvider {
   readonly codes = new Map<string, CodeRecord>();
   readonly accessTokens = new Map<string, TokenRecord>();
   readonly refreshTokens = new Map<string, TokenRecord>();
+  readonly pendingConsents = new Map<string, PendingConsent>();
   private saveQueue = Promise.resolve();
 
   constructor(private readonly resourceUrl: URL, private readonly options: ProviderOptions = {}) {
@@ -94,26 +142,46 @@ export class DoxaOAuthProvider implements OAuthServerProvider {
       );
       if (state.version !== 1) throw new Error("Unsupported OAuth state version");
       this.clientsStore.clients.clear();
-      for (const [key, value] of state.clients) this.clientsStore.clients.set(key, value);
+      let removedClient = false;
+      for (const [key, value] of state.clients) {
+        if (value.redirect_uris.length && value.redirect_uris.every(isAllowedChatGptRedirect)) {
+          this.clientsStore.clients.set(key, value);
+        } else {
+          removedClient = true;
+        }
+      }
       this.codes.clear();
       for (const [key, value] of state.codes) {
-        this.codes.set(key, {
-          ...value,
-          params: {
-            ...value.params,
-            resource: value.params.resource ? new URL(value.params.resource) : undefined,
-          },
-        });
+        if (this.clientsStore.clients.has(value.clientId)) {
+          this.codes.set(key, {
+            ...value,
+            params: {
+              ...value.params,
+              resource: value.params.resource ? new URL(value.params.resource) : undefined,
+            },
+          });
+        } else {
+          removedClient = true;
+        }
       }
       this.accessTokens.clear();
       for (const [key, value] of state.accessTokens) {
-        this.accessTokens.set(key, { ...value, resource: new URL(value.resource) });
+        if (this.clientsStore.clients.has(value.clientId)) {
+          this.accessTokens.set(key, { ...value, resource: new URL(value.resource) });
+        } else {
+          removedClient = true;
+        }
       }
       this.refreshTokens.clear();
       for (const [key, value] of state.refreshTokens) {
-        this.refreshTokens.set(key, { ...value, resource: new URL(value.resource) });
+        if (this.clientsStore.clients.has(value.clientId)) {
+          this.refreshTokens.set(key, { ...value, resource: new URL(value.resource) });
+        } else {
+          removedClient = true;
+        }
       }
       this.pruneExpired();
+      if (removedClient) await this.persist();
     } catch (error: any) {
       if (error?.cause?.code === "ENOENT" || error?.code === "ENOENT") return;
       throw error;
@@ -126,16 +194,58 @@ export class DoxaOAuthProvider implements OAuthServerProvider {
     }
     this.assertResource(params.resource);
     this.assertScopes(params.scopes ?? []);
+    this.prunePendingConsents();
+    const consentId = opaqueToken();
+    const csrfToken = opaqueToken();
+    const sessionToken = opaqueToken();
+    this.pendingConsents.set(consentId, {
+      clientId: client.client_id,
+      params,
+      csrfHash: sha256(csrfToken),
+      sessionHash: sha256(sessionToken),
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+    res.setHeader("Set-Cookie", `doxa_oauth_session=${sessionToken}; Path=/approve; HttpOnly; Secure; SameSite=Strict; Max-Age=300`);
+    res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.status(200).type("html").send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Authorize Doxa access</title>
+<style>body{font:16px system-ui;max-width:44rem;margin:4rem auto;padding:0 1rem;color:#162033}dl{background:#f4f6fa;padding:1rem;border-radius:.5rem}dt{font-weight:700;margin-top:.7rem}dd{margin:.2rem 0;overflow-wrap:anywhere}.actions{display:flex;gap:.75rem;margin-top:1.5rem}button{padding:.7rem 1rem;border:0;border-radius:.4rem;background:#174ea6;color:white;font-weight:700}button[value=deny]{background:#59636e}</style></head>
+<body><h1>Authorize Doxa access</h1><p>Review this request before granting access to your shared vault.</p>
+<dl><dt>Client</dt><dd>${escapeHtml(client.client_name ?? client.client_id)}</dd><dt>Redirect URI</dt><dd>${escapeHtml(params.redirectUri)}</dd><dt>Requested scopes</dt><dd>${escapeHtml((params.scopes ?? []).join(" "))}</dd></dl>
+<form method="post" action="/approve"><input type="hidden" name="consent_id" value="${consentId}"><input type="hidden" name="csrf_token" value="${csrfToken}"><div class="actions"><button type="submit" name="decision" value="approve">Authorize</button><button type="submit" name="decision" value="deny">Deny</button></div></form></body></html>`);
+  }
+
+  async approveConsent(consentId: string, csrfToken: string, sessionToken: string, decision: string, res: Response): Promise<void> {
+    this.prunePendingConsents();
+    const pending = this.pendingConsents.get(consentId);
+    if (!pending
+      || !safeEqual(pending.csrfHash, sha256(csrfToken))
+      || !safeEqual(pending.sessionHash, sha256(sessionToken))) {
+      res.status(403).send("Invalid or expired authorization confirmation");
+      return;
+    }
+    this.pendingConsents.delete(consentId);
+    const client = this.clientsStore.getClient(pending.clientId);
+    if (!client || !client.redirect_uris.includes(pending.params.redirectUri)) {
+      res.status(400).send("Invalid OAuth client");
+      return;
+    }
+    const callback = new URL(pending.params.redirectUri);
+    if (pending.params.state) callback.searchParams.set("state", pending.params.state);
+    if (decision !== "approve") {
+      callback.searchParams.set("error", "access_denied");
+      res.redirect(302, callback.href);
+      return;
+    }
     const code = opaqueToken();
     this.codes.set(code, {
       clientId: client.client_id,
-      params,
+      params: pending.params,
       expiresAt: Date.now() + 5 * 60 * 1000,
     });
     await this.persist();
-    const callback = new URL(params.redirectUri);
     callback.searchParams.set("code", code);
-    if (params.state) callback.searchParams.set("state", params.state);
     res.redirect(302, callback.href);
   }
 
@@ -227,6 +337,13 @@ export class DoxaOAuthProvider implements OAuthServerProvider {
     for (const [key, value] of this.codes) if (value.expiresAt <= now) this.codes.delete(key);
     for (const [key, value] of this.accessTokens) if (value.expiresAt <= now) this.accessTokens.delete(key);
     for (const [key, value] of this.refreshTokens) if (value.expiresAt <= now) this.refreshTokens.delete(key);
+  }
+
+  private prunePendingConsents(): void {
+    const now = Date.now();
+    for (const [key, value] of this.pendingConsents) {
+      if (value.expiresAt <= now) this.pendingConsents.delete(key);
+    }
   }
 
   private snapshot(): StoredState {
